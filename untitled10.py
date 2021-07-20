@@ -1,25 +1,38 @@
-import warnings
-import seaborn as sns
-from sklearn.metrics import mean_absolute_percentage_error
-from scipy.spatial import distance
-from sklearn.preprocessing import scale
-import numpy as np
-from collections import defaultdict
-from functools import reduce
-import zipfile
+import re
 import io
 import os
+import warnings
+import zipfile
+from collections import defaultdict
+from functools import reduce
+
 import requests
-from yellowbrick.cluster import KElbowVisualizer
-from sklearn import cluster
+import nltk
+import scipy
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.pipeline import make_pipeline
 from sklearn.compose import make_column_transformer
 from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import scale
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 from surprise import SVD, Dataset, Reader, KNNWithMeans
-# from surprise.model_selection import KFold
-import pandas as pd
-import bra_utils as butils
+from yellowbrick.cluster import KElbowVisualizer
+
+# %%
+
+rand_state = 10
+samp_size = 5
+
+sns.set_theme()
 
 # %%
 
@@ -41,9 +54,7 @@ tags = pd.read_csv(os.path.join(dir_path, 'ml-latest-small', 'tags.csv'))
 
 # %%
 
-rng = np.random.RandomState(10)
-
-samp_size = 5
+rng = np.random.RandomState(rand_state)
 
 rand_users = rng.choice(rats['userId'].unique(),
                         size=samp_size,
@@ -79,7 +90,7 @@ for i in np.where(~users_vecs_scaled.any(axis=1))[0]:
         scale=0.1,
         size=users_vecs_scaled.shape[1]) / np.iinfo(np.int64).max
 
-users_dists_mtx = (distance
+users_dists_mtx = (scipy.spatial.distance
                    .cdist(users_vecs_scaled,
                           users_vecs_scaled,
                           'cosine'))
@@ -125,7 +136,6 @@ custom_mape = mean_absolute_percentage_error(
     rats_tiny_arr.flat[rates_test_idx].ravel(),
     rates_est[rates_test_idx])
 
-
 # %%
 
 tiny_data = (Dataset
@@ -138,6 +148,7 @@ tiny_testset = tiny_trainset.build_testset()
 tiny_anti_testset = tiny_trainset.build_anti_testset()
 
 algo = KNNWithMeans(sim_options={'name': 'cosine'}, verbose=False)
+
 algo.fit(tiny_trainset)
 
 tiny_estimations = algo.test(tiny_testset)
@@ -158,6 +169,8 @@ module_mape = mean_absolute_percentage_error(*zip(*list(
 mlt_idx = pd.MultiIndex.from_product(
     [rats_tiny_mtx.index,
      rats_tiny_mtx.columns])
+
+# %%
 
 custom_rec = pd.DataFrame(rates_est,
                           index=mlt_idx)
@@ -200,12 +213,12 @@ txt_1_2 = ''
 txt_2_2 = """Custom Recommender:
 est. rates for unknown
 user-movie pairs
-(to recommend)"""
+(to recommend or not)"""
 
 txt_3_2 = """Module Recommender:
 est. rates for unknown
 user-movie pairs
-(to recommend)"""
+(to recommend or not)"""
 
 
 orig_mtx['type'] = txt_1_1
@@ -237,25 +250,27 @@ data_viz = pd.concat([data_viz, data_viz_copy])
 
 # %%
 
-sns.set_theme()
+vmin, vmax = data_viz[0].agg(['min', 'max'])
 
 
 def draw_heatmap(*args, **kwargs):
 
-    data = kwargs.pop('data')
+    d_raw = kwargs.pop('data')
 
-    d = data.pivot(index=args[0], columns=args[1], values=args[2])
-    d_mask = (data.pivot(index=args[0],
+    d_pvt = d_raw.pivot(index=args[0], columns=args[1], values=args[2])
+    d_msk = (d_raw.pivot(index=args[0],
                          columns=args[1],
                          values=args[3])
-              .astype(bool))
+             .astype(bool))
 
-    sns.heatmap(d,
+    sns.heatmap(d_pvt,
                 annot=True,
                 annot_kws={'fontsize': 13},
                 fmt='.1f',
+                vmin=vmin,
+                vmax=vmax,
                 cbar=False,
-                mask=d_mask,
+                mask=d_msk,
                 **kwargs)
 
 
@@ -266,6 +281,7 @@ fg = sns.FacetGrid(data_viz,
                    aspect=0.8)
 
 # https://docs.python.org/3/library/warnings.html#temporarily-suppressing-warnings
+
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     fg.map_dataframe(draw_heatmap,
@@ -285,66 +301,15 @@ for i, ax in enumerate(fg.axes.flat):
         ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=10)
     ax.set_xticklabels(ax.get_xticklabels(), fontsize=10)
 
-fg.set_titles(col_template="{col_name}",  size=15)
+fg.set_titles(col_template='{col_name}',  size=15)
 fg.fig.tight_layout()
 
 # %%
 
-
-def precision_recall_at_k(predictions, k=5, threshold=3.5):
-    """Return precision and recall at k metrics for each user"""
-
-    # First map the predictions to each user.
-    user_est_true = defaultdict(list)
-    for uid, _, true_r, est, _ in predictions:
-        user_est_true[uid].append((est, true_r))
-
-    precisions = dict()
-    recalls = dict()
-    for uid, user_ratings in user_est_true.items():
-
-        uid = 1
-        user_ratings = user_est_true[uid]
-        y_score, y_true = zip(*user_ratings)
-        y_true_2 = [true_r >= threshold for true_r in y_true]
-        y_score_2 = [est_r >= threshold for est_r in y_score]
-
-        top_k_accuracy_score(y_true_2, y_score_2, k=5)
-
-        from sklearn.metrics import top_k_accuracy_score
-
-        # Sort user ratings by estimated value
-        user_ratings.sort(key=lambda x: x[0], reverse=True)
-
-        # Number of relevant items
-        n_rel = sum((true_r >= threshold) for (_, true_r) in user_ratings)
-
-        # Number of recommended items in top k
-        n_rec_k = sum((est >= threshold) for (est, _) in user_ratings[:k])
-
-        # Number of relevant and recommended items in top k
-        n_rel_and_rec_k = sum(((true_r >= threshold) and (est >= threshold))
-                              for (est, true_r) in user_ratings[:k])
-
-        # Precision@K: Proportion of recommended items that are relevant
-        # When n_rec_k is 0, Precision is undefined. We here set it to 0.
-
-        precisions[uid] = n_rel_and_rec_k / n_rec_k if n_rec_k != 0 else 0
-
-        # Recall@K: Proportion of relevant items that are recommended
-        # When n_rel is 0, Recall is undefined. We here set it to 0.
-
-        recalls[uid] = n_rel_and_rec_k / n_rel if n_rel != 0 else 0
-
-    return precisions, recalls
-
-
-# %%
-
 movs_genre_dct = {}
+
 for idx, row in movs.iterrows():
     movs_genre_dct[row['movieId']] = row['genres'].split('|')
-
 
 movs_genre_dfr = (pd.DataFrame
                   .from_dict(movs_genre_dct, orient='index')
@@ -369,6 +334,7 @@ movs['year'] = movs['title'].str.extract(r'\(.*(\d{4})\)')
 # %%
 
 tags_dct = defaultdict(set)
+
 for idx, row in tags.iterrows():
     tags_dct[row['movieId']].add(row['tag'])
 
@@ -382,7 +348,6 @@ tags_dfr = (pd.DataFrame
 
 # %%
 
-
 movs_data = reduce(lambda left, right:
                    pd.merge(left,
                             right,
@@ -390,7 +355,6 @@ movs_data = reduce(lambda left, right:
                             on='movieId',
                             copy=False),
                    [movs, movs_genre_dfr, tags_dfr])
-
 
 movs_data['title_tags'] = movs_data['title'].str.cat(movs_data['tags'],
                                                      sep=' ',
@@ -409,23 +373,69 @@ movs_data.fillna(movs_data.mode().iloc[0], inplace=True)
 
 # %%
 
+
+class FrequencyEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, cols):
+        self.cols = cols
+        self.ref_dic = None
+
+    @staticmethod
+    def _get_enc(ser):
+        count = ser.value_counts()
+        noise = abs(np.random.normal(5e-6, 1e-5, len(count)))
+        return (count / count.sum() + noise).to_dict()
+
+    def fit(self, X, y=None):
+        self.ref_dic = {}
+        for col in self.cols:
+            col_enc = self._get_enc(X[col])
+            self.ref_dic[col] = col_enc
+        return self
+
+    def transform(self, X, y=None):
+        for col in self.cols:
+            X[col] = X[col].apply(
+                lambda x, col=col: self.ref_dic[col].get(x, 0))
+        return X
+
+# %%
+
+
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'\d+', '', text)
+    return text
+
+
+class StemmedTfidfVectorizer(TfidfVectorizer):
+
+    english_stemmer = nltk.stem.SnowballStemmer('english')
+
+    def build_analyzer(self):
+        analyzer = TfidfVectorizer.build_analyzer(self)
+        return lambda doc: (self.english_stemmer.stem(w)
+                            for w in analyzer(doc))
+
+# %%
+
+
 data_pipe = make_pipeline(
-    butils.FrequencyEncoder(['year']),
+    FrequencyEncoder(['year']),
     make_column_transformer(
-        (butils.StemmedTfidfVectorizer(stop_words='english',
-                                       preprocessor=butils.preprocess_text,
-                                       decode_error='ignore',
-                                       max_features=500),
+        (StemmedTfidfVectorizer(stop_words='english',
+                                preprocessor=preprocess_text,
+                                decode_error='ignore',
+                                max_features=500),
          'title_tags'),
         remainder='passthrough'),
     TruncatedSVD(n_components=50,
-                 random_state=1234))
+                 random_state=rand_state))
 
 movs_data_enc = data_pipe.fit_transform(movs_data)
 
 # %%
 
-model = cluster.KMeans(random_state=1234)
+model = KMeans(random_state=rand_state)
 
 visualizer = KElbowVisualizer(model,
                               k=10,
@@ -436,17 +446,17 @@ visualizer.show()
 
 # %%
 
-kmeans = cluster.KMeans(visualizer.elbow_value_, random_state=1234)
-kmeans.fit(movs_data_enc)
+model_tuned = KMeans(visualizer.elbow_value_, random_state=rand_state)
 
-movs_data['cluster'] = kmeans.labels_
+model_tuned.fit(movs_data_enc)
+
+movs_data['cluster'] = model_tuned.labels_
 
 movs_data.groupby('cluster').size()
 
-cluster_dct = dict(zip(movs_data.index, kmeans.labels_))
+cluster_dct = dict(zip(movs_data.index, model_tuned.labels_))
 
 rats['cluster'] = rats['movieId'].map(lambda x: cluster_dct[x])
-
 
 # %%
 
@@ -455,52 +465,68 @@ data = (Dataset
 
 raw_ratings = data.raw_ratings
 
-# kf = KFold(n_splits=5, random_state=1234)  # surprise
-kf = KFold(n_splits=5, shuffle=True, random_state=1234)  # sklearn
+kf = KFold(n_splits=3, shuffle=True, random_state=rand_state)
 
-algo = SVD(random_state=1234)
-
-# %%
-
-# for trainset, testset in kf.split(data):
-#     algo.fit(trainset)
-#     predictions = algo.test(testset)
-#     precisions, recalls = precision_recall_at_k(predictions, k=5, threshold=4)
-
-#     # Precision and recall can then be averaged over all users
-#     print(sum(prec for prec in precisions.values()) / len(precisions))
-#     print(sum(rec for rec in recalls.values()) / len(recalls))
+algo = SVD(random_state=rand_state)
 
 # %%
 
+# https://surprise.readthedocs.io/en/stable/FAQ.html#how-to-compute-precision-k-and-recall-k
 
-def get_predictions(train_index, test_index, algo=algo):
-    A_raw_ratings = [raw_ratings[i] for i in train_index]
-    B_raw_ratings = [raw_ratings[i] for i in test_index]
+
+def precision_recall_at_k(predictions, k=5, threshold=4):
+    """Return precision and recall at k metrics for each user"""
+
+    user_est_true = defaultdict(list)
+
+    for uid, _, true_r, est, _ in predictions:
+        user_est_true[uid].append((est, true_r))
+
+    prec = dict()
+    recs = dict()
+
+    for uid, user_ratings in user_est_true.items():
+
+        user_ratings.sort(key=lambda x: x[0], reverse=True)
+
+        n_rel = sum((true_r >= threshold) for (_, true_r) in user_ratings)
+
+        n_rec_k = sum((est >= threshold) for (est, _) in user_ratings[:k])
+
+        n_rel_and_rec_k = sum(((true_r >= threshold) and (est >= threshold))
+                              for (est, true_r) in user_ratings[:k])
+
+        prec[uid] = n_rel_and_rec_k / n_rec_k if n_rec_k != 0 else 0
+
+        recs[uid] = n_rel_and_rec_k / n_rel if n_rel != 0 else 0
+
+    return prec, recs
+
+# %%
+
+
+def get_predictions(trn_index, tst_index, alg=algo):
+
+    A_raw_ratings = [raw_ratings[i] for i in trn_index]
+    B_raw_ratings = [raw_ratings[i] for i in tst_index]
 
     data.raw_ratings = A_raw_ratings
 
     trainset = data.build_full_trainset()
     testset = data.construct_testset(B_raw_ratings)
 
-    algo.fit(trainset)
+    alg.fit(trainset)
 
-    return algo.test(testset)
+    return alg.test(testset)
+
 
 # %%
 
+folds_metrics_data = []
 
-for train_index, test_index in kf.split(raw_ratings):
-    predictions = get_predictions(train_index, test_index)
-    precisions, recalls = precision_recall_at_k(predictions)
+for i, (train_index, test_index) in enumerate(kf.split(raw_ratings), 1):
 
-    # Precision and recall can then be averaged over all users
-    print(sum(prec for prec in precisions.values()) / len(precisions))
-    print(sum(rec for rec in recalls.values()) / len(recalls))
-
-# %%
-
-for train_index, test_index in kf.split(raw_ratings):
+    no_cl_predictions = get_predictions(train_index, test_index)
 
     cl_predictions = []
 
@@ -515,10 +541,74 @@ for train_index, test_index in kf.split(raw_ratings):
 
         cl_predictions.extend(get_predictions(*cl_index))
 
-    precisions, recalls = precision_recall_at_k(cl_predictions)
+    for key, val in dict(zip(
+            ['raw items', 'clustered'],
+            [no_cl_predictions, cl_predictions])).items():
 
-    # Precision and recall can then be averaged over all users
-    print(sum(prec for prec in precisions.values()) / len(precisions))
-    print(sum(rec for rec in recalls.values()) / len(recalls))
+        precisions, recalls = precision_recall_at_k(val)
+
+        folds_metrics_data.append(pd.concat(
+            [pd.Series(precisions,
+                       name="""SVD-recommender's precision at k=5
+(distribution by users and mean)"""),
+             pd.Series(recalls,
+                       name="""SVD-recommender's recall at k=5
+(distribution by users and mean)""")],
+            axis=1)
+            .assign(fold='fold #{}'.format(i))
+            .assign(case=key))
 
 # %%
+
+folds_metrics_viz = (pd.concat(folds_metrics_data, ignore_index=True)
+                     .melt(id_vars=['fold', 'case']))
+
+row, col, hue = ('fold', 'variable', 'case')
+means = (np.asarray(folds_metrics_viz
+                    .groupby([row, col, hue])['value']
+                    .mean())
+         .reshape(-1, 2))
+
+# %%
+
+fg = sns.FacetGrid(data=folds_metrics_viz,
+                   row=row,
+                   col=col,
+                   hue=hue,
+                   margin_titles=True,
+                   height=3,
+                   aspect=2.25)
+
+fg.map(sns.kdeplot,
+       'value',
+       clip=(0, 1),
+       bw_adjust=1.25,
+       linewidth=1.5)
+
+
+for i, ax in enumerate(fg.axes.flat):
+
+    if i == 0:
+        ax.legend()
+
+    # https://stackoverflow.com/questions/28956622/how-to-locate-the-median-in-a-seaborn-kde-plot
+
+    for j, line in enumerate(ax.get_lines()):
+
+        x, y = line.get_data()
+
+        nearest_to_mean = np.abs(x - np.flip(means[i])[j]).argmin()
+        x_mean = x[nearest_to_mean]
+        y_mean = y[nearest_to_mean]
+
+        ax.vlines(x=x_mean,
+                  ymin=0,
+                  ymax=y_mean,
+                  linestyles='--',
+                  colors=line.get_color(),
+                  linewidth=1)
+
+fg.set_titles(col_template='{col_name}',
+              row_template='{row_name}',
+              size=15)
+fg.fig.tight_layout()
