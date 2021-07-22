@@ -1,10 +1,11 @@
 import re
 import io
 import os
+import time
 import warnings
 import zipfile
-from collections import defaultdict
-from functools import reduce
+from collections import defaultdict, namedtuple
+from functools import reduce, wraps
 
 import requests
 import nltk
@@ -24,8 +25,11 @@ from sklearn.preprocessing import scale
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from surprise import SVD, Dataset, Reader, KNNWithMeans
+from surprise import Dataset, Reader, KNNWithMeans, SVD
+
 from yellowbrick.cluster import KElbowVisualizer
+from memory_profiler import memory_usage
+from pytrends.request import TrendReq
 
 # %%
 
@@ -33,6 +37,16 @@ rand_state = 10
 samp_size = 5
 
 sns.set_theme()
+
+# %%
+
+pytrend = TrendReq()
+pytrend.build_payload(['online shopping'], timeframe='2020-01-01 2020-12-31')
+df_trends = pytrend.interest_over_time()
+
+ax = sns.lineplot(x=df_trends.index, y=df_trends['online shopping'])
+ax.set(ylabel='iterest over time (%)', xlabel='')
+ax.title.set_text("Google trend for search term 'online shopping'")
 
 # %%
 
@@ -201,12 +215,12 @@ user-movie pairs
 txt_2_1 = """Custom Recommender:
 est. rates for known
 user-movie pairs
-(MAPE = {:.2f})""".format(custom_mape)
+(biased MAPE = {:.2f})""".format(custom_mape)
 
 txt_3_1 = """Module Recommender:
 est. rates for known
 user-movie pairs
-(MAPE = {:.2f})""".format(module_mape)
+(biased MAPE = {:.2f})""".format(module_mape)
 
 txt_1_2 = ''
 
@@ -458,6 +472,8 @@ cluster_dct = dict(zip(movs_data.index, model_tuned.labels_))
 
 rats['cluster'] = rats['movieId'].map(lambda x: cluster_dct[x])
 
+print(rats.groupby('cluster').size())
+
 # %%
 
 data = (Dataset
@@ -505,6 +521,36 @@ def precision_recall_at_k(predictions, k=5, threshold=4):
 # %%
 
 
+res_metrics = []
+Res = namedtuple('Res', ['fold', 'case', 'time', 'mem'])
+
+# https://hakibenita.com/fast-load-data-python-postgresql
+
+
+def profile(fn):
+
+    @wraps(fn)
+    def inner(*args, **kwargs):
+
+        fold = kwargs.pop('fold')
+        case = kwargs.pop('case')
+
+        tm = time.perf_counter()
+        retval = fn(*args, **kwargs)
+        elapsed = time.perf_counter() - tm
+
+        mem, retval = memory_usage(
+            (fn, args, kwargs), retval=True, timeout=200, interval=1e-7)
+
+        res_metrics.append(Res(fold, case, elapsed, max(mem) - min(mem)))
+        return retval
+
+    return inner
+
+# %%
+
+
+@profile
 def get_predictions(trn_index, tst_index, alg=algo):
 
     A_raw_ratings = [raw_ratings[i] for i in trn_index]
@@ -526,7 +572,10 @@ folds_metrics_data = []
 
 for i, (train_index, test_index) in enumerate(kf.split(raw_ratings), 1):
 
-    no_cl_predictions = get_predictions(train_index, test_index)
+    no_cl_predictions = get_predictions(train_index,
+                                        test_index,
+                                        fold=i,
+                                        case='raw items')
 
     cl_predictions = []
 
@@ -539,7 +588,9 @@ for i, (train_index, test_index) in enumerate(kf.split(raw_ratings), 1):
                             .pipe(lambda x, cl=cl:
                                   x[x['cluster'] == cl].index))
 
-        cl_predictions.extend(get_predictions(*cl_index))
+        cl_predictions.extend(get_predictions(*cl_index,
+                                              fold=i,
+                                              case='clustered'))
 
     for key, val in dict(zip(
             ['raw items', 'clustered'],
@@ -549,11 +600,11 @@ for i, (train_index, test_index) in enumerate(kf.split(raw_ratings), 1):
 
         folds_metrics_data.append(pd.concat(
             [pd.Series(precisions,
-                       name="""SVD-recommender's precision at k=5
-(distribution by users and mean)"""),
+                       name="""SVD recommender's precision at k=5
+(distribution and average over all users)"""),
              pd.Series(recalls,
-                       name="""SVD-recommender's recall at k=5
-(distribution by users and mean)""")],
+                       name="""SVD recommender's recall at k=5
+(distribution and average over all users)""")],
             axis=1)
             .assign(fold='fold #{}'.format(i))
             .assign(case=key))
@@ -612,3 +663,11 @@ fg.set_titles(col_template='{col_name}',
               row_template='{row_name}',
               size=15)
 fg.fig.tight_layout()
+
+# %%
+
+compare_res_metrics = (pd.DataFrame(res_metrics)
+                       .groupby(['fold', 'case'])
+                       .agg({'time': 'sum', 'mem': 'max'})
+                       .groupby(level='case')
+                       .mean())
